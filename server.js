@@ -25,6 +25,9 @@ app.use(express.json());
 app.use('/api/rooms', roomRoutes);
 
 // Health check
+app.get("/", (req, res) => {
+  res.send("Chat Server is running");
+})
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
 });
