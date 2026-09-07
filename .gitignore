@@ -1,0 +1,106 @@
+# ========================
+
+# Logs
+
+# ========================
+
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ========================
+
+# Dependency directories
+
+# ========================
+
+node_modules/
+
+# ========================
+
+# Build folders
+
+# ========================
+
+dist-ssr/
+build/
+.out/
+
+# ========================
+
+# Environment variables
+
+# ========================
+
+.env
+.env.*
+!.env.example
+
+# ========================
+
+# Cache & temp files
+
+# ========================
+
+.cache/
+.parcel-cache/
+.next/
+.nuxt/
+.svelte-kit/
+coverage/
+*.tmp
+*.temp
+
+# ========================
+
+# OS files
+
+# ========================
+
+.DS_Store
+Thumbs.db
+
+# ========================
+
+# Editor / IDE
+
+# ========================
+
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# ========================
+
+# Optional (if using TypeScript)
+
+# ========================
+
+*.tsbuildinfo
+
+# ========================
+
+# Optional (if using Docker)
+
+# ========================
+
+Dockerfile*
+docker-compose*
+
+# ========================
+
+# Optional (if using Firebase / AWS configs)
+
+# ========================
+
+.firebase/
+.aws/
