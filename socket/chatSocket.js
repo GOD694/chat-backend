@@ -2,9 +2,10 @@ const Room = require('../models/Room');
 const Message = require('../models/Message');
 
 const setupChatSocket = (io) => {
-  io.on('connection', (socket) => {
-    // console.log(`[Socket Connected] ID: ${socket.id}`);
+  // Grace period timeouts for host disconnection (e.g. quick browser reload)
+  const hostDisconnectTimeouts = new Map();
 
+  io.on('connection', (socket) => {
     // Join a room
     socket.on('join_room', async ({ roomCode, participantId, participantName }) => {
       try {
@@ -27,6 +28,13 @@ const setupChatSocket = (io) => {
         socket.participantId = participantId;
 
         const isHost = room.hostId === participantId;
+
+        // If host joins / reconnects, cancel any pending host disconnect timeout
+        if (isHost && hostDisconnectTimeouts.has(roomCode)) {
+          clearTimeout(hostDisconnectTimeouts.get(roomCode));
+          hostDisconnectTimeouts.delete(roomCode);
+        }
+
         const existingParticipantIndex = room.participants.findIndex(
           (p) => p.participantId === participantId
         );
@@ -34,7 +42,7 @@ const setupChatSocket = (io) => {
         let isNewParticipant = false;
 
         if (existingParticipantIndex !== -1) {
-          // Update existing participant's socket ID and status
+          // Update existing participant's socket ID and online status
           room.participants[existingParticipantIndex].socketId = socket.id;
           room.participants[existingParticipantIndex].isOnline = true;
           room.participants[existingParticipantIndex].name = participantName;
@@ -54,7 +62,7 @@ const setupChatSocket = (io) => {
 
         await room.save();
 
-        // If new participant, broadcast system notification
+        // If new participant and not host, broadcast system notification
         if (isNewParticipant && !isHost) {
           const joinMsg = new Message({
             roomCode,
@@ -68,13 +76,12 @@ const setupChatSocket = (io) => {
           io.to(roomChannel).emit('new_message', joinMsg);
         }
 
-        // Send updated participants list to everyone in room
+        // Send updated active participants list to everyone in room
+        const activeParticipants = room.participants.filter((p) => p.isOnline !== false);
         io.to(roomChannel).emit('update_participants', {
-          participants: room.participants,
+          participants: activeParticipants,
           hostId: room.hostId,
         });
-
-        // console.log(`[User Joined] ${participantName} (${participantId}) in room ${roomCode}`);
       } catch (err) {
         console.error('Error on join_room:', err);
       }
@@ -111,6 +118,9 @@ const setupChatSocket = (io) => {
         });
 
         await newMsg.save();
+
+        // Ensure socket is joined in the room channel
+        socket.join(`room_${roomCode}`);
 
         // Broadcast to all sockets in the room
         io.to(`room_${roomCode}`).emit('new_message', newMsg);
@@ -151,7 +161,6 @@ const setupChatSocket = (io) => {
           target.isMuted = isMuted;
           await room.save();
 
-          // System message announcement
           const actionText = isMuted ? 'muted' : 'unmuted';
           const sysMsg = new Message({
             roomCode,
@@ -164,12 +173,12 @@ const setupChatSocket = (io) => {
           await sysMsg.save();
 
           io.to(`room_${roomCode}`).emit('new_message', sysMsg);
+          const activeParticipants = room.participants.filter((p) => p.isOnline !== false);
           io.to(`room_${roomCode}`).emit('update_participants', {
-            participants: room.participants,
+            participants: activeParticipants,
             hostId: room.hostId,
           });
 
-          // Also alert the target directly
           io.to(`room_${roomCode}`).emit('participant_mute_status', {
             targetParticipantId,
             isMuted,
@@ -206,7 +215,7 @@ const setupChatSocket = (io) => {
           const targetName = target.name;
           const targetSocketId = target.socketId;
 
-          // Remove participant from room
+          // Remove participant completely from room
           room.participants = room.participants.filter(
             (p) => p.participantId !== targetParticipantId
           );
@@ -234,8 +243,9 @@ const setupChatSocket = (io) => {
           await sysMsg.save();
 
           io.to(`room_${roomCode}`).emit('new_message', sysMsg);
+          const activeParticipants = room.participants.filter((p) => p.isOnline !== false);
           io.to(`room_${roomCode}`).emit('update_participants', {
-            participants: room.participants,
+            participants: activeParticipants,
             hostId: room.hostId,
           });
         }
@@ -244,7 +254,7 @@ const setupChatSocket = (io) => {
       }
     });
 
-    // Host Moderation: End Room
+    // Host Moderation: End Room (Room Disappears)
     socket.on('end_room', async ({ roomCode, hostId }) => {
       try {
         const room = await Room.findOne({ code: roomCode });
@@ -255,23 +265,23 @@ const setupChatSocket = (io) => {
           return;
         }
 
-        room.isActive = false;
-        await room.save();
+        // Cancel any pending disconnect timeouts
+        if (hostDisconnectTimeouts.has(roomCode)) {
+          clearTimeout(hostDisconnectTimeouts.get(roomCode));
+          hostDisconnectTimeouts.delete(roomCode);
+        }
 
-        const sysMsg = new Message({
-          roomCode,
-          senderId: 'system',
-          senderName: 'System',
-          isHost: false,
-          text: `🚪 The host ended the room. All participants have been disconnected.`,
-          isSystem: true,
-        });
-        await sysMsg.save();
+        // Permanently delete room and messages so it disappears completely
+        await Room.deleteOne({ code: roomCode });
+        await Message.deleteMany({ roomCode });
 
-        io.to(`room_${roomCode}`).emit('new_message', sysMsg);
+        // Notify all participants that room has ended
         io.to(`room_${roomCode}`).emit('room_ended', {
-          message: 'The host has closed this room.',
+          message: 'The host has ended and closed this room.',
         });
+
+        // Automatically eject all participants from socket channel
+        io.in(`room_${roomCode}`).socketsLeave(`room_${roomCode}`);
       } catch (err) {
         console.error('Error on end_room:', err);
       }
@@ -301,59 +311,138 @@ const setupChatSocket = (io) => {
       }
     });
 
-    // Participant leaves voluntarily
+    // User leaves voluntarily (Host or Participant)
     socket.on('leave_room', async ({ roomCode, participantId, participantName }) => {
       try {
         socket.leave(`room_${roomCode}`);
         const room = await Room.findOne({ code: roomCode });
-        if (room) {
-          const p = room.participants.find((p) => p.participantId === participantId);
-          if (p) {
-            p.isOnline = false;
-            await room.save();
+        if (!room) return;
 
-            const sysMsg = new Message({
-              roomCode,
-              senderId: 'system',
-              senderName: 'System',
-              isHost: false,
-              text: `${participantName || 'A participant'} left the room.`,
-              isSystem: true,
-            });
-            await sysMsg.save();
-
-            io.to(`room_${roomCode}`).emit('new_message', sysMsg);
-            io.to(`room_${roomCode}`).emit('update_participants', {
-              participants: room.participants,
-              hostId: room.hostId,
-            });
+        // 1. IF THE HOST LEAVES -> Room disappears for everyone!
+        if (room.hostId === participantId) {
+          if (hostDisconnectTimeouts.has(roomCode)) {
+            clearTimeout(hostDisconnectTimeouts.get(roomCode));
+            hostDisconnectTimeouts.delete(roomCode);
           }
+
+          // Delete room and its chat messages completely
+          await Room.deleteOne({ code: roomCode });
+          await Message.deleteMany({ roomCode });
+
+          // Inform all remaining participants in the room
+          io.to(`room_${roomCode}`).emit('room_ended', {
+            message: 'The host has left the room. The room has been closed.',
+          });
+
+          // Kick all sockets out of the channel
+          io.in(`room_${roomCode}`).socketsLeave(`room_${roomCode}`);
+          return;
         }
+
+        // 2. IF A PARTICIPANT LEAVES -> Remove their ID completely from the participant list!
+        room.participants = room.participants.filter(
+          (p) => p.participantId !== participantId
+        );
+        await room.save();
+
+        const sysMsg = new Message({
+          roomCode,
+          senderId: 'system',
+          senderName: 'System',
+          isHost: false,
+          text: `${participantName || 'A participant'} left the room.`,
+          isSystem: true,
+        });
+        await sysMsg.save();
+
+        io.to(`room_${roomCode}`).emit('new_message', sysMsg);
+
+        const activeParticipants = room.participants.filter((p) => p.isOnline !== false);
+        io.to(`room_${roomCode}`).emit('update_participants', {
+          participants: activeParticipants,
+          hostId: room.hostId,
+        });
       } catch (err) {
         console.error('Error on leave_room:', err);
       }
     });
 
-    // Socket disconnection
+    // Socket disconnection (tab closed, internet dropped, etc.)
     socket.on('disconnect', async () => {
-      console.log(`[Socket Disconnected] ID: ${socket.id}`);
-      if (socket.roomCode && socket.participantId) {
-        try {
-          const room = await Room.findOne({ code: socket.roomCode });
-          if (room) {
-            const p = room.participants.find((item) => item.participantId === socket.participantId);
-            if (p) {
-              p.isOnline = false;
-              await room.save();
-              io.to(`room_${socket.roomCode}`).emit('update_participants', {
-                participants: room.participants,
-                hostId: room.hostId,
-              });
-            }
+      const { roomCode, participantId } = socket;
+      if (!roomCode || !participantId) return;
+
+      try {
+        const room = await Room.findOne({ code: roomCode });
+        if (!room) return;
+
+        // 1. IF HOST DISCONNECTED:
+        // Set a brief grace period (4 seconds) to differentiate between a quick page refresh vs tab close.
+        if (room.hostId === participantId) {
+          // Mark host as offline temporarily
+          const hostEntry = room.participants.find((p) => p.participantId === participantId);
+          if (hostEntry) {
+            hostEntry.isOnline = false;
+            await room.save();
           }
-        } catch (err) {
-          console.error('Error on socket disconnect cleanup:', err);
+
+          // Start timer: if host does not reconnect in 4 seconds, destroy room completely
+          const timer = setTimeout(async () => {
+            hostDisconnectTimeouts.delete(roomCode);
+            try {
+              const currentRoom = await Room.findOne({ code: roomCode });
+              if (currentRoom) {
+                const hostOnline = currentRoom.participants.find(
+                  (p) => p.participantId === currentRoom.hostId && p.isOnline
+                );
+
+                if (!hostOnline) {
+                  // Host did not reconnect -> delete room
+                  await Room.deleteOne({ code: roomCode });
+                  await Message.deleteMany({ roomCode });
+
+                  io.to(`room_${roomCode}`).emit('room_ended', {
+                    message: 'The host disconnected and the room was closed.',
+                  });
+
+                  io.in(`room_${roomCode}`).socketsLeave(`room_${roomCode}`);
+                }
+              }
+            } catch (cleanupErr) {
+              console.error('Error cleaning up abandoned room after host disconnect:', cleanupErr);
+            }
+          }, 3000);
+
+          hostDisconnectTimeouts.set(roomCode, timer);
+          return;
         }
+
+        // 2. IF PARTICIPANT DISCONNECTED:
+        // Completely remove participant from the room so their ID no longer shows in participant list
+        const leavingParticipant = room.participants.find((p) => p.participantId === participantId);
+        room.participants = room.participants.filter((p) => p.participantId !== participantId);
+        await room.save();
+
+        if (leavingParticipant) {
+          const sysMsg = new Message({
+            roomCode,
+            senderId: 'system',
+            senderName: 'System',
+            isHost: false,
+            text: `${leavingParticipant.name} left the room.`,
+            isSystem: true,
+          });
+          await sysMsg.save();
+          io.to(`room_${roomCode}`).emit('new_message', sysMsg);
+        }
+
+        const activeParticipants = room.participants.filter((p) => p.isOnline !== false);
+        io.to(`room_${roomCode}`).emit('update_participants', {
+          participants: activeParticipants,
+          hostId: room.hostId,
+        });
+      } catch (err) {
+        console.error('Error on socket disconnect cleanup:', err);
       }
     });
   });

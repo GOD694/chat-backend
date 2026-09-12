@@ -109,8 +109,8 @@ router.get('/:code', async (req, res) => {
     const { code } = req.params;
     const room = await Room.findOne({ code });
 
-    if (!room) {
-      return res.status(404).json({ success: false, message: 'Room not found.' });
+    if (!room || !room.isActive) {
+      return res.status(404).json({ success: false, message: 'Room not found or has been closed by the host.' });
     }
 
     const messages = await Message.find({ roomCode: code }).sort({ createdAt: 1 });
@@ -123,7 +123,7 @@ router.get('/:code', async (req, res) => {
         hostId: room.hostId,
         hostName: room.hostName,
         isActive: room.isActive,
-        participants: room.participants,
+        participants: room.participants.filter((p) => p.isOnline !== false),
       },
       messages,
     });
