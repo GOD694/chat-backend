@@ -4,6 +4,47 @@ const Message = require('../models/Message');
 const setupChatSocket = (io) => {
   // Grace period timeouts for host disconnection (e.g. quick browser reload)
   const hostDisconnectTimeouts = new Map();
+  const HOST_DISCONNECT_GRACE_MS = 30000;
+
+  const isParticipantSocketStale = (participant, socketId) =>
+    participant && participant.socketId && participant.socketId !== socketId;
+
+  const scheduleHostRoomCleanup = (roomCode) => {
+    if (hostDisconnectTimeouts.has(roomCode)) {
+      clearTimeout(hostDisconnectTimeouts.get(roomCode));
+    }
+
+    const timer = setTimeout(async () => {
+      hostDisconnectTimeouts.delete(roomCode);
+      try {
+        const currentRoom = await Room.findOne({ code: roomCode });
+        if (!currentRoom) return;
+
+        const hostEntry = currentRoom.participants.find(
+          (p) => p.participantId === currentRoom.hostId
+        );
+        const hostSocketLive =
+          hostEntry?.socketId && io.sockets.sockets.get(hostEntry.socketId);
+
+        if (hostEntry?.isOnline || hostSocketLive) {
+          return;
+        }
+
+        await Room.deleteOne({ code: roomCode });
+        await Message.deleteMany({ roomCode });
+
+        io.to(`room_${roomCode}`).emit('room_ended', {
+          message: 'The host disconnected and the room was closed.',
+        });
+
+        io.in(`room_${roomCode}`).socketsLeave(`room_${roomCode}`);
+      } catch (cleanupErr) {
+        console.error('Error cleaning up abandoned room after host disconnect:', cleanupErr);
+      }
+    }, HOST_DISCONNECT_GRACE_MS);
+
+    hostDisconnectTimeouts.set(roomCode, timer);
+  };
 
   io.on('connection', (socket) => {
     // Join a room
@@ -377,49 +418,28 @@ const setupChatSocket = (io) => {
         if (!room) return;
 
         // 1. IF HOST DISCONNECTED:
-        // Set a brief grace period (4 seconds) to differentiate between a quick page refresh vs tab close.
+        // Ignore stale disconnects when the host already reconnected on a newer socket.
         if (room.hostId === participantId) {
-          // Mark host as offline temporarily
           const hostEntry = room.participants.find((p) => p.participantId === participantId);
+          if (isParticipantSocketStale(hostEntry, socket.id)) {
+            return;
+          }
+
           if (hostEntry) {
             hostEntry.isOnline = false;
             await room.save();
           }
 
-          // Start timer: if host does not reconnect in 4 seconds, destroy room completely
-          const timer = setTimeout(async () => {
-            hostDisconnectTimeouts.delete(roomCode);
-            try {
-              const currentRoom = await Room.findOne({ code: roomCode });
-              if (currentRoom) {
-                const hostOnline = currentRoom.participants.find(
-                  (p) => p.participantId === currentRoom.hostId && p.isOnline
-                );
-
-                if (!hostOnline) {
-                  // Host did not reconnect -> delete room
-                  await Room.deleteOne({ code: roomCode });
-                  await Message.deleteMany({ roomCode });
-
-                  io.to(`room_${roomCode}`).emit('room_ended', {
-                    message: 'The host disconnected and the room was closed.',
-                  });
-
-                  io.in(`room_${roomCode}`).socketsLeave(`room_${roomCode}`);
-                }
-              }
-            } catch (cleanupErr) {
-              console.error('Error cleaning up abandoned room after host disconnect:', cleanupErr);
-            }
-          }, 3000);
-
-          hostDisconnectTimeouts.set(roomCode, timer);
+          scheduleHostRoomCleanup(roomCode);
           return;
         }
 
         // 2. IF PARTICIPANT DISCONNECTED:
         // Completely remove participant from the room so their ID no longer shows in participant list
         const leavingParticipant = room.participants.find((p) => p.participantId === participantId);
+        if (isParticipantSocketStale(leavingParticipant, socket.id)) {
+          return;
+        }
         room.participants = room.participants.filter((p) => p.participantId !== participantId);
         await room.save();
 
